@@ -8,9 +8,10 @@ from rich.console import Console
 from rich.table import Table
 from rich.prompt import Prompt
 from rich import box
-from .api import APIClient
+from .api import APIClient, AmazonAPIClient
 from .downloader import Downloader
 from .metadata import MetadataWriter
+from .playlist import PlaylistExtractor
 
 console = Console()
 
@@ -18,33 +19,34 @@ console = Console()
 def cli():
     pass
 
-@cli.command(help="Download tracks, albums, or artists based on a search query.")
+@cli.command(help="Download tracks, albums, artists or playlists based on a search query.")
 @click.option("--track", is_flag=True, help="Search for specific tracks")
 @click.option("--album", is_flag=True, help="Search for albums")
 @click.option("--artist", is_flag=True, help="Search for artists")
-@click.option("--query", "-q", required=True, help="Search term/query")
-@click.option("--quality", type=click.Choice(["LOSSLESS", "HI_RES_LOSSLESS"]), default="LOSSLESS", help="Audio quality (16/24 bits)")
+@click.option("--playlist", is_flag=True, help="Download from a playlist URL (Spotify, YouTube, etc.)")
+@click.option("--query", "-q", required=True, help="Search term/query or URL")
+@click.option("--quality", type=click.Choice(["LOSSLESS", "HI_RES_LOSSLESS"]), default="HI_RES_LOSSLESS", help="Audio quality (16/24 bits)")
 @click.option("--output", "-o", default="./downloads", help="Output directory path")
-def download(track, album, artist, query, quality, output):
-    """Main command to handle the downloading process."""
-    flags = [track, album, artist]
+def download(track, album, artist, playlist, query, quality, output):
+    flags = [track, album, artist, playlist]
     if sum(flags) != 1:
-        console.print("[red]You must specify exactly one of: --track, --album, --artist[/red]")
+        console.print("[red]You must specify exactly one of: --track, --album, --artist, --playlist[/red]")
         return
 
     client = APIClient()
+    amazon_client = AmazonAPIClient()
     downloader = Downloader(output)
     writer = MetadataWriter()
 
-    if track: _handle_track_search(client, query, quality, downloader, writer)
-    elif album: _handle_album_search(client, query, quality, downloader, writer)
-    elif artist: _handle_artist_search(client, query, quality, downloader, writer)
+    if track: _handle_track_search(client, amazon_client, query, quality, downloader, writer)
+    elif album: _handle_album_search(client, amazon_client, query, quality, downloader, writer)
+    elif artist: _handle_artist_search(client, amazon_client, query, quality, downloader, writer)
+    elif playlist: _handle_playlist_download(client, amazon_client, query, quality, output, writer)
 
 def format_artists(artists_data) -> str:
-    """Format artist list avoiding duplicate appearances."""
     seen = set()
     artists_list = []
-    for a in (artists_data or []):
+    for a in (artists_data or[]):
         name = a.name if hasattr(a, 'name') else a.get('name', '')
         if name:
             name_upper = name.upper()
@@ -54,7 +56,6 @@ def format_artists(artists_data) -> str:
     return ", ".join(artists_list[:3]) + ("..." if len(artists_list) > 3 else "")
 
 def format_title(item) -> str:
-    """Combine base title with track version if applicable."""
     title = item.title if hasattr(item, 'title') else item.get('title', '')
     version = item.version if hasattr(item, 'version') else item.get('version', '')
     if version and version.lower() not in title.lower():
@@ -62,7 +63,6 @@ def format_title(item) -> str:
     return title
 
 def deduplicate_tracks(tracks_list):
-    """Filter tracks prioritizing the highest available audio quality."""
     unique_tracks = {}
     qualities = {"LOW": 1, "HIGH": 2, "LOSSLESS": 3, "HI_RES_LOSSLESS": 4}
 
@@ -81,10 +81,15 @@ def deduplicate_tracks(tracks_list):
                 
     return list(unique_tracks.values())
 
-def _handle_track_search(client, query, quality, downloader, writer):
-    """Search and download specific tracks."""
+def sanitize_foldername(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+
+def _handle_track_search(client, amazon_client, query, quality, downloader, writer):
     with console.status("[bold green]Searching for tracks..."):
         all_tracks = client.search_tracks(query)
+        if not all_tracks:
+            console.print("[yellow]Not found in primary API, trying Amazon API...[/yellow]")
+            all_tracks = amazon_client.search_tracks(query)
 
     q_lower = query.lower().strip()
     matched_tracks = [t for t in all_tracks if q_lower in t.title.lower()]
@@ -94,7 +99,7 @@ def _handle_track_search(client, query, quality, downloader, writer):
         console.print("[red]No tracks found matching your search exactly.[/red]")
         return
 
-    table = _create_compact_table(":musical_note: Found Tracks", ["#", "Title", "Artist(s)", "Album", "Quality", "Duration"])
+    table = _create_compact_table(":musical_note: Found Tracks",["#", "Title", "Artist(s)", "Album", "Quality", "Duration"])
     for i, t in enumerate(tracks, 1):
         artists_str = format_artists(t.artists)
         mins, secs = divmod(t.duration, 60)
@@ -111,10 +116,9 @@ def _handle_track_search(client, query, quality, downloader, writer):
     choice = Prompt.ask("Numbers to download (e.g., 1,3-5, all)", default="all")
     selected = tracks if choice.lower() == "all" else _parse_choice(choice, tracks)
     for track in selected:
-        _download_track(track.id, quality, client, downloader, writer)
+        _download_track(track.id, quality, client, amazon_client, downloader, writer)
 
-def _handle_album_search(client, query, quality, downloader, writer):
-    """Search and process whole albums."""
+def _handle_album_search(client, amazon_client, query, quality, downloader, writer):
     with console.status("[bold green]Searching for albums..."):
         all_tracks = client.search_tracks(query)
 
@@ -156,9 +160,9 @@ def _handle_album_search(client, query, quality, downloader, writer):
         console.print("[red]No tracks found in this album.[/red]")
         return
 
-    table = _create_compact_table(f":cd: Tracks in {album.title}", ["#", "Title", "Artist(s)", "Quality", "Duration", "ID"])
+    table = _create_compact_table(f":cd: Tracks in {album.title}",["#", "Title", "Artist(s)", "Quality", "Duration", "ID"])
     for i, item in enumerate(album_info.items, 1):
-        artists_str = format_artists(item.get("artists", []))
+        artists_str = format_artists(item.get("artists",[]))
         mins, secs = divmod(item.get("duration", 0), 60)
         table.add_row(
             str(i), 
@@ -175,10 +179,9 @@ def _handle_album_search(client, query, quality, downloader, writer):
     for item in selected:
         track_id = item.get("id")
         if track_id:
-            _download_track(track_id, quality, client, downloader, writer)
+            _download_track(track_id, quality, client, amazon_client, downloader, writer)
 
 def normalize_str(s):
-    """Normalize string for catalog authentication."""
     if not s: return ""
     s = s.lower().strip()
     s = re.sub(r'\(.*?\)', '', s)  
@@ -188,7 +191,6 @@ def normalize_str(s):
     return s
 
 def get_itunes_fingerprint(artist_name: str):
-    """Fetch iTunes catalog fingerprint to verify official releases."""
     search_url = f"https://itunes.apple.com/search?term={urllib.parse.quote(artist_name)}&entity=song&limit=50"
     albums = set()
     tracks = set()
@@ -197,7 +199,7 @@ def get_itunes_fingerprint(artist_name: str):
         if resp.status_code != 200:
             return albums, tracks
             
-        results = resp.json().get("results", [])
+        results = resp.json().get("results",[])
         artist_ids = {}
         target_name = artist_name.lower()
         
@@ -215,7 +217,7 @@ def get_itunes_fingerprint(artist_name: str):
         resp2 = requests.get(lookup_url, timeout=5)
         
         if resp2.status_code == 200:
-            for item in resp2.json().get("results", []):
+            for item in resp2.json().get("results",[]):
                 if item.get("collectionName"):
                     albums.add(normalize_str(item["collectionName"]))
                 if item.get("trackName"):
@@ -234,15 +236,14 @@ def get_itunes_fingerprint(artist_name: str):
         pass
     return albums, tracks
 
-def _handle_artist_search(client, query, quality, downloader, writer):
-    """Search and download an artist's official, authenticated discography."""
+def _handle_artist_search(client, amazon_client, query, quality, downloader, writer):
     with console.status("[bold green]Searching for artists..."):
         tracks = client.search_tracks(query)
 
     artists_dict = {}
     q_lower = query.lower().strip()
     for t in tracks:
-        for a in (t.artists or []):
+        for a in (t.artists or[]):
             if a.name and a.name.lower().strip() == q_lower:
                 if a.id not in artists_dict:
                     artists_dict[a.id] = a
@@ -275,9 +276,9 @@ def _handle_artist_search(client, query, quality, downloader, writer):
         console.print("[red]No tracks found for this artist.[/red]")
         return
 
-    strict_tracks = []
+    strict_tracks =[]
     for t in artist_info.tracks:
-        track_artists = t.artists or []
+        track_artists = t.artists or[]
         if t.artist: track_artists.append(t.artist)
         for a in track_artists:
             if a and a.name and a.id:
@@ -299,7 +300,7 @@ def _handle_artist_search(client, query, quality, downloader, writer):
                 if t.album:
                     verified_album_ids.add(t.album.id)
 
-    final_tracks = []
+    final_tracks =[]
     discarded_albums = set()
     
     for t in unique_tracks.values():
@@ -340,8 +341,7 @@ def _handle_artist_search(client, query, quality, downloader, writer):
         console.print(f"\n[bold red]:heavy_check_mark: Catalog purified![/bold red] [dim]Hid {len(discarded_albums)} impostor releases.[/dim]\n")
 
     track_table = _create_compact_table(
-        f":musical_note: Official Tracks for {artist.name}",
-        ["#", "Title", "Artist(s)", "Album", "Quality", "Duration"]
+        f":musical_note: Official Tracks for {artist.name}",["#", "Title", "Artist(s)", "Album", "Quality", "Duration"]
     )
     
     for i, t in enumerate(sorted_tracks, 1):
@@ -360,11 +360,51 @@ def _handle_artist_search(client, query, quality, downloader, writer):
     choice = Prompt.ask("Numbers to download (e.g., 1,3-5, all)", default="all")
     selected = sorted_tracks if choice.lower() == "all" else _parse_choice(choice, sorted_tracks)
     for track in selected:
-        _download_track(track.id, quality, client, downloader, writer)
+        _download_track(track.id, quality, client, amazon_client, downloader, writer)
+
+def _handle_playlist_download(client, amazon_client, url, quality, base_output, writer):
+    with console.status("[bold green]Extracting playlist metadata..."):
+        extractor = PlaylistExtractor()
+        try:
+            playlist_name, tracks = extractor.get_tracks(url)
+        except Exception as e:
+            console.print(f"[red]Error extracting playlist: {e}[/red]")
+            return
+
+    if not tracks:
+        console.print("[red]No tracks found in the provided playlist URL.[/red]")
+        return
+
+    safe_name = sanitize_foldername(playlist_name) or "Playlist"
+    playlist_dir = os.path.join(base_output, safe_name)
+    downloader = Downloader(playlist_dir)
+
+    console.print(f"[green]Found {len(tracks)} tracks in '{playlist_name}'. Starting matching and download...[/green]")
+    
+    for t in tracks:
+        query = f"{t['title']} {t['artist']}".strip()
+        console.print(f"\n[cyan]Searching:[/cyan] {query}")
+        
+        results = client.search_tracks(query)
+        if not results:
+            results = client.search_tracks(t['title'])
+            
+        if not results:
+            console.print("[yellow]Not found in primary API, trying Amazon API...[/yellow]")
+            results = amazon_client.search_tracks(query)
+            if not results:
+                results = amazon_client.search_tracks(t['title'])
+            
+        if not results:
+            console.print(f"[red]Not found in any API: {t['title']}[/red]")
+            continue
+            
+        best = deduplicate_tracks(results)
+        target_track = best[0] if best else results[0]
+        _download_track(target_track.id, quality, client, amazon_client, downloader, writer)
 
 def _parse_choice(choice, items, is_dict=False):
-    """Parse user selection string into a list of items."""
-    selected = []
+    selected =[]
     parts = choice.split(",")
     for part in parts:
         part = part.strip()
@@ -379,17 +419,17 @@ def _parse_choice(choice, items, is_dict=False):
                 selected.append(items[idx])
     return selected
 
-def _download_track(track_id, quality, client, downloader, writer):
-    """Process individual track download and apply ID3 tags."""
+def _download_track(track_id, quality, client, amazon_client, downloader, writer):
+    active_client = amazon_client if isinstance(track_id, str) else client
     console.print(f"\n[yellow]Fetching information for track {track_id}...[/yellow]")
     try:
-        info = client.get_track_info(track_id)
+        info = active_client.get_track_info(track_id)
         try:
-            manifest = client.get_track_manifest(track_id, quality)
+            manifest = active_client.get_track_manifest(track_id, quality)
         except Exception:
             alt_quality = "HI_RES_LOSSLESS" if quality == "LOSSLESS" else "LOSSLESS"
             console.print(f"[yellow]Retrying with quality {alt_quality}...[/yellow]")
-            manifest = client.get_track_manifest(track_id, alt_quality)
+            manifest = active_client.get_track_manifest(track_id, alt_quality)
 
         console.print(f"[green]Downloading audio: {info.title}[/green]")
         filepath = downloader.download_track(track_id, manifest, info)
@@ -411,7 +451,6 @@ def _download_track(track_id, quality, client, downloader, writer):
         console.print(f"[bold red]Error processing track {track_id}: {e}[/bold red]")
 
 def _create_compact_table(title: str, columns: list) -> Table:
-    """Create a strictly formatted, single-line table with smart truncation."""
     table = Table(
         title=title,
         box=box.ROUNDED,

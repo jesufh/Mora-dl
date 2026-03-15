@@ -7,7 +7,6 @@ logger = logging.getLogger(__name__)
 
 class MetadataWriter:
     def __init__(self):
-        """Initialize HTTP session for asset downloading with necessary bypass headers."""
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -16,17 +15,25 @@ class MetadataWriter:
             "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
         })
 
-    def download_cover(self, cover_uuid: str) -> bytes | None:
-        """Download cover art from image resources using the provided UUID hash."""
-        if not cover_uuid:
+    def download_cover(self, cover_id: str) -> bytes | None:
+        if not cover_id:
             return None
 
-        clean_uuid = cover_uuid.replace("-", "")
+        if cover_id.startswith("http"):
+            try:
+                resp = self.session.get(cover_id, timeout=15)
+                resp.raise_for_status()
+                return resp.content
+            except requests.RequestException as e:
+                logger.error(f"Error downloading cover {cover_id}: {e}")
+                return None
+
+        clean_uuid = cover_id.replace("-", "")
         if len(clean_uuid) != 32:
-            logger.error(f"Invalid cover UUID: {cover_uuid}")
+            logger.error(f"Invalid cover UUID: {cover_id}")
             return None
 
-        parts = [
+        parts =[
             clean_uuid[0:8], clean_uuid[8:12], clean_uuid[12:16],
             clean_uuid[16:20], clean_uuid[20:32]
         ]
@@ -42,7 +49,6 @@ class MetadataWriter:
             return None
 
     def write_flac(self, filepath: str, metadata: TrackInfo, cover_data: bytes | None = None) -> None:
-        """Write ID3/FLAC metadata tags to the downloaded raw file."""
         try:
             audio = FLAC(filepath)
         except Exception as e:

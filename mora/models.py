@@ -1,21 +1,21 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 
 class Artist(BaseModel):
-    id: int
+    id: Union[int, str]
     name: str
     picture: Optional[str] = None
     type: Optional[str] = None
 
 class Album(BaseModel):
-    id: int
+    id: Union[int, str]
     title: str
     cover: Optional[str] = None
     vibrantColor: Optional[str] = None
     artist: Optional[Artist] = None
 
 class TrackSearchItem(BaseModel):
-    id: int
+    id: Union[int, str]
     title: str
     duration: int
     popularity: Optional[int] = None
@@ -24,6 +24,7 @@ class TrackSearchItem(BaseModel):
     album: Album
     explicit: Optional[bool] = False
     audioQuality: Optional[str] = None
+    mediaMetadata: Optional[dict] = None
     version: Optional[str] = None
     isrc: Optional[str] = None
     copyright: Optional[str] = None
@@ -39,7 +40,7 @@ class TrackInfo(TrackSearchItem):
     pass
 
 class AlbumInfo(BaseModel):
-    id: int
+    id: Union[int, str]
     title: str
     cover: Optional[str] = None
     artists: List[Artist]

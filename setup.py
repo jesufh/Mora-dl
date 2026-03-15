@@ -11,6 +11,7 @@ setup(
         "pydantic>=2.0.0",
         "mutagen>=1.46.0",
         "tqdm>=4.65.0",
+        "imageio-ffmpeg>=0.6.0",
     ],
     entry_points={
         "console_scripts": [

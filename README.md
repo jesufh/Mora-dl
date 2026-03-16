@@ -1,6 +1,6 @@
 # Mora-dl
 <div align="center">
-  <img width="150" height="150" alt="logo" src="https://github.com/user-attachments/assets/d1fdc2e7-ea03-4666-bd3c-9ecdb20afd33"/></br> 
+  <img alt="logo" src="https://i.imgur.com/fnneFa9.png"/></br> 
   <b>A simple and efficient scraper for Tidal to download FLAC music.</b>
 </div>
 <br>
@@ -15,9 +15,10 @@ Python 3.10+ is required, and you must use the new Windows terminal if you want 
 
 You can install and prepare the project using the `setup.py` command or install the dependencies using `requirements.txt`, whichever you prefer.
 ```bash
+# Using setup.py
 pip install -e .
-```
-```bash
+
+# Install requirements and run the module
 pip install -r requirements.txt
 ```
 

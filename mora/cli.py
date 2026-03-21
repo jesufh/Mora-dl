@@ -86,10 +86,10 @@ def sanitize_foldername(name: str) -> str:
 
 def _handle_track_search(client, amazon_client, query, quality, downloader, writer):
     with console.status("[bold green]Searching for tracks..."):
-        all_tracks = client.search_tracks(query)
-        if not all_tracks:
-            console.print("[yellow]Not found in primary API, trying Amazon API...[/yellow]")
-            all_tracks = amazon_client.search_tracks(query)
+        # all_tracks = client.search_tracks(query)
+        # if not all_tracks:
+        #     console.print("[yellow]Not found in primary API, trying Amazon API...[/yellow]")
+        all_tracks = amazon_client.search_tracks(query)
 
     q_lower = query.lower().strip()
     matched_tracks = [t for t in all_tracks if q_lower in t.title.lower()]

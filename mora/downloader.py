@@ -48,7 +48,8 @@ class Downloader:
             url = inner.get("url")
             if not url:
                 raise ValueError(f"Direct URL is empty for track {track_id}")
-            return self._download_direct(url, metadata)
+            drm_key = inner.get("drm_key")
+            return self._download_direct(url, metadata, drm_key)
 
         manifest_b64 = inner.get("manifest")
         if not manifest_b64:
@@ -63,12 +64,50 @@ class Downloader:
         else:
             raise ValueError(f"Unsupported manifest type: {mime}")
 
-    def _download_direct(self, url: str, metadata: TrackInfo) -> str:
+    def _get_ffmpeg_path(self) -> str:
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            return "ffmpeg"
+
+    def _download_direct(self, url: str, metadata: TrackInfo, drm_key: str = None) -> str:
         artist_names = ", ".join([a.name for a in metadata.artists if a.name])
         filename = self._sanitize_filename(f"{artist_names} - {metadata.title}.flac")
-        path = os.path.join(self.output_dir, filename)
-        self._download_file(url, path, desc=metadata.title)
-        return path
+        final_path = os.path.join(self.output_dir, filename)
+        
+        if drm_key:
+            # Descargamos a un archivo temporal MP4 cifrado
+            temp_path = os.path.join(self.output_dir, f"{metadata.id}_encrypted.mp4")
+            self._download_file(url, temp_path, desc=metadata.title)
+            
+            ffmpeg_cmd = self._get_ffmpeg_path()
+            try:
+                # Usamos FFmpeg para descifrar el CENC y extraer el stream FLAC sin perder calidad (-c:a copy)
+                subprocess.run([
+                    ffmpeg_cmd, "-y", 
+                    "-decryption_key", drm_key, 
+                    "-i", temp_path, 
+                    "-c:a", "copy", 
+                    final_path
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise Exception("FFmpeg is not available. Install 'imageio-ffmpeg' (pip install imageio-ffmpeg) or install FFmpeg on your system.")
+            except subprocess.CalledProcessError as e:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise Exception(f"Error decrypting and extracting FLAC with FFmpeg: {e}")
+                
+            # Limpiamos el archivo temporal
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        else:
+            # Si no hay clave DRM, asumimos que ya es un FLAC crudo
+            self._download_file(url, final_path, desc=metadata.title)
+            
+        return final_path
 
     def _download_bts(self, manifest_bytes: bytes, metadata: TrackInfo) -> str:
         data = json.loads(manifest_bytes)
@@ -82,13 +121,6 @@ class Downloader:
         path = os.path.join(self.output_dir, filename)
         self._download_file(url, path, desc=metadata.title)
         return path
-
-    def _get_ffmpeg_path(self) -> str:
-        try:
-            import imageio_ffmpeg
-            return imageio_ffmpeg.get_ffmpeg_exe()
-        except ImportError:
-            return "ffmpeg"
 
     def _download_dash(self, manifest_xml: bytes, metadata: TrackInfo) -> str:
         root = ET.fromstring(manifest_xml)

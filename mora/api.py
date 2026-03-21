@@ -116,34 +116,31 @@ class AmazonAPIClient:
 
     def search_tracks(self, query: str) -> List[TrackSearchItem]:
         data = self._post("search", {"query": query, "country": "US", "content_type": "TRACK", "limit": 24})
-        items =[]
-        for item in data.get("trackList",[]):
+        items = []
+        for item in data.get("trackList", []):
             try:
                 album_data = item.get("album", {})
-                artist_data = item.get("artist", {})
-                
+                artist_name = item.get("primaryArtistName") or item.get("artistName") or "Unknown Artist"
+
                 album = Album(
-                    id=album_data.get("asin", ""),
-                    title=album_data.get("title", "Unknown Album"),
+                    id="",
+                    title=album_data.get("title", ""),
                     cover=album_data.get("image")
                 )
-                
-                artist = Artist(
-                    id=artist_data.get("asin", ""),
-                    name=artist_data.get("name", item.get("primaryArtistName", "Unknown Artist"))
-                )
-                
+
+                artist = Artist(id="", name=artist_name)
+
+                explicit = "[Explicit]" in item.get("title", "")
+
                 items.append(TrackSearchItem(
                     id=item.get("asin"),
-                    title=item.get("title"),
-                    duration=item.get("duration", 0),
+                    title=item.get("title", ""),
+                    duration=0,
                     artist=artist,
                     artists=[artist],
                     album=album,
-                    explicit=item.get("parentalControls", {}).get("hasExplicitLanguage", False),
+                    explicit=explicit,
                     audioQuality="LOSSLESS",
-                    isrc=item.get("isrc"),
-                    trackNumber=int(item.get("trackNum", 1)) if item.get("trackNum") else None
                 ))
             except Exception:
                 continue
@@ -152,10 +149,10 @@ class AmazonAPIClient:
     def get_track_info(self, asin: str) -> TrackInfo:
         data = self._post("track", {"asin": asin, "tier": "best", "country": "US"})
         meta = data.get("metadata", {})
-        
-        album = Album(id=meta.get("album", ""), title=meta.get("album", "Unknown"), cover=meta.get("cover"))
-        artist = Artist(id=meta.get("artist", ""), name=meta.get("artist", "Unknown"))
-        
+
+        album = Album(id="", title=meta.get("album", ""), cover=meta.get("cover"))
+        artist = Artist(id="", name=meta.get("artist", "Unknown"))
+
         return TrackInfo(
             id=meta.get("asin", asin),
             title=meta.get("title", ""),
@@ -168,19 +165,23 @@ class AmazonAPIClient:
             isrc=meta.get("isrc"),
             copyright=meta.get("copyright"),
             releaseDate=meta.get("date"),
-            trackNumber=int(meta.get("track_number", 1)) if meta.get("track_number") else None
+            trackNumber=int(meta.get("track_number", 1)) if meta.get("track_number") else None,
+            volumeNumber=int(meta.get("disc_number", 1)) if meta.get("disc_number") else None
         )
 
     def get_track_manifest(self, asin: str, quality: str = "LOSSLESS") -> Dict[str, Any]:
         data = self._post("track", {"asin": asin, "tier": "best", "country": "US"})
-        stream_url = data.get("stream", {}).get("url")
+        stream = data.get("stream", {})
+        stream_url = stream.get("url")
         if not stream_url:
             raise Exception(f"Could not fetch a valid stream for track {asin}")
-            
+
         full_url = f"https://amz.redsleaks.to{stream_url}"
         return {
             "data": {
                 "manifestMimeType": "direct",
-                "url": full_url
+                "url": full_url,
+                "codec": stream.get("codec", "flac"),
+                "drm_key": data.get("drm", {}).get("key")
             }
         }

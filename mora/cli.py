@@ -15,11 +15,7 @@ from .playlist import PlaylistExtractor
 
 console = Console()
 
-@click.group(help="Mora Scraper - Download FLAC music from the hifi API.")
-def cli():
-    pass
-
-@cli.command(help="Download tracks, albums, artists or playlists based on a search query.")
+@click.command(help="Download tracks, albums, artists, or playlists based on a search query.")
 @click.option("--track", is_flag=True, help="Search for specific tracks")
 @click.option("--album", is_flag=True, help="Search for albums")
 @click.option("--artist", is_flag=True, help="Search for artists")
@@ -27,7 +23,7 @@ def cli():
 @click.option("--query", "-q", required=True, help="Search term/query or URL")
 @click.option("--quality", type=click.Choice(["LOSSLESS", "HI_RES_LOSSLESS"]), default="HI_RES_LOSSLESS", help="Audio quality (16/24 bits)")
 @click.option("--output", "-o", default="./downloads", help="Output directory path")
-def download(track, album, artist, playlist, query, quality, output):
+def cli(track, album, artist, playlist, query, quality, output):
     flags = [track, album, artist, playlist]
     if sum(flags) != 1:
         console.print("[red]You must specify exactly one of: --track, --album, --artist, --playlist[/red]")
@@ -99,7 +95,7 @@ def _handle_track_search(client, amazon_client, query, quality, downloader, writ
         console.print("[red]No tracks found matching your search exactly.[/red]")
         return
 
-    table = _create_compact_table(":musical_note: Found Tracks",["#", "Title", "Artist(s)", "Album", "Quality", "Duration"])
+    table = _create_compact_table("Found Tracks",["#", "Title", "Artist(s)", "Album", "Quality", "Duration"])
     for i, t in enumerate(tracks, 1):
         artists_str = format_artists(t.artists)
         mins, secs = divmod(t.duration, 60)
@@ -119,24 +115,36 @@ def _handle_track_search(client, amazon_client, query, quality, downloader, writ
         _download_track(track.id, quality, client, amazon_client, downloader, writer)
 
 def _handle_album_search(client, amazon_client, query, quality, downloader, writer):
+    using_amazon = False
     with console.status("[bold green]Searching for albums..."):
         all_tracks = client.search_tracks(query)
+        if not all_tracks:
+            using_amazon = True
+            all_tracks = amazon_client.search_tracks(query)
 
     q_lower = query.lower().strip()
     albums_dict = {}
+    album_tracks = {}
     
     for t in all_tracks:
         if t.album and q_lower in t.album.title.lower():
-            if t.album.id not in albums_dict:
+            album_id = t.album.id
+            if using_amazon:
+                artist_label = t.artist.name if t.artist and t.artist.name else "Unknown"
+                album_id = f"amz:{normalize_str(t.album.title)}:{normalize_str(artist_label)}"
+                t.album.id = album_id
+            if album_id not in albums_dict:
                 t.album.artist = t.artists[0] if t.artists else None
-                albums_dict[t.album.id] = t.album
+                albums_dict[album_id] = t.album
+                album_tracks[album_id] = []
+            album_tracks[album_id].append(t)
 
     albums = list(albums_dict.values())
     if not albums:
         console.print("[red]No albums found matching your search exactly.[/red]")
         return
 
-    table = _create_compact_table(":cd: Found Albums", ["#", "Album", "Artist", "ID"])
+    table = _create_compact_table("Found Albums", ["#", "Album", "Artist", "ID"])
     for i, al in enumerate(albums, 1):
         artist_name = al.artist.name if al.artist else "Various"
         table.add_row(str(i), al.title, artist_name, str(al.id))
@@ -153,6 +161,32 @@ def _handle_album_search(client, amazon_client, query, quality, downloader, writ
         console.print("[red]Invalid number[/red]")
         return
 
+    table = _create_compact_table(f"Tracks in {album.title}",["#", "Title", "Artist(s)", "Quality", "Duration", "ID"])
+    if using_amazon:
+        selected_album_tracks = deduplicate_tracks(album_tracks.get(album.id, []))
+        if not selected_album_tracks:
+            console.print("[red]No tracks found in this album.[/red]")
+            return
+
+        for i, track in enumerate(selected_album_tracks, 1):
+            artists_str = format_artists(track.artists)
+            mins, secs = divmod(track.duration, 60)
+            table.add_row(
+                str(i),
+                format_title(track),
+                artists_str,
+                track.audioQuality or "N/A",
+                f"{mins}:{secs:02d}",
+                str(track.id),
+            )
+        console.print(table)
+
+        choice = Prompt.ask("Numbers to download (e.g., 1,3-5, all)", default="all")
+        selected_tracks = selected_album_tracks if choice.lower() == "all" else _parse_choice(choice, selected_album_tracks)
+        for track in selected_tracks:
+            _download_track(track.id, quality, client, amazon_client, downloader, writer)
+        return
+
     with console.status(f"[bold green]Fetching tracks for {album.title}..."):
         album_info = client.get_album(album.id)
 
@@ -160,7 +194,6 @@ def _handle_album_search(client, amazon_client, query, quality, downloader, writ
         console.print("[red]No tracks found in this album.[/red]")
         return
 
-    table = _create_compact_table(f":cd: Tracks in {album.title}",["#", "Title", "Artist(s)", "Quality", "Duration", "ID"])
     for i, item in enumerate(album_info.items, 1):
         artists_str = format_artists(item.get("artists",[]))
         mins, secs = divmod(item.get("duration", 0), 60)
@@ -237,8 +270,12 @@ def get_itunes_fingerprint(artist_name: str):
     return albums, tracks
 
 def _handle_artist_search(client, amazon_client, query, quality, downloader, writer):
+    using_amazon = False
     with console.status("[bold green]Searching for artists..."):
         tracks = client.search_tracks(query)
+        if not tracks:
+            using_amazon = True
+            tracks = amazon_client.search_tracks(query)
 
     artists_dict = {}
     q_lower = query.lower().strip()
@@ -253,7 +290,7 @@ def _handle_artist_search(client, amazon_client, query, quality, downloader, wri
         console.print(f"[red]No artists found with the exact name '{query}'.[/red]")
         return
 
-    artist_table = _create_compact_table(":microphone: Found Artists", ["#", "Artist", "ID"])
+    artist_table = _create_compact_table("Found Artists", ["#", "Artist", "ID"])
     for i, a in enumerate(artists, 1):
         artist_table.add_row(str(i), a.name, str(a.id))
     console.print(artist_table)
@@ -269,22 +306,35 @@ def _handle_artist_search(client, amazon_client, query, quality, downloader, wri
         console.print("[red]Invalid number[/red]")
         return
 
-    with console.status(f"[bold green]Authenticating discography (Removing false metadata)..."):
-        artist_info = client.get_artist(artist.id)
+    if using_amazon:
+        strict_tracks = []
+        for t in tracks:
+            track_artists = list(t.artists or [])
+            if t.artist:
+                track_artists.append(t.artist)
+            for a in track_artists:
+                if a and a.name and a.id:
+                    if str(a.id) == str(artist.id) and a.name.lower().strip() == artist.name.lower().strip():
+                        strict_tracks.append(t)
+                        break
+    else:
+        with console.status("[bold green]Authenticating discography (removing false metadata)..."):
+            artist_info = client.get_artist(artist.id)
 
-    if not artist_info.tracks:
-        console.print("[red]No tracks found for this artist.[/red]")
-        return
+        if not artist_info.tracks:
+            console.print("[red]No tracks found for this artist.[/red]")
+            return
 
-    strict_tracks =[]
-    for t in artist_info.tracks:
-        track_artists = t.artists or[]
-        if t.artist: track_artists.append(t.artist)
-        for a in track_artists:
-            if a and a.name and a.id:
-                if str(a.id) == str(artist.id) and a.name.lower().strip() == artist.name.lower().strip():
-                    strict_tracks.append(t)
-                    break
+        strict_tracks =[]
+        for t in artist_info.tracks:
+            track_artists = list(t.artists or [])
+            if t.artist:
+                track_artists.append(t.artist)
+            for a in track_artists:
+                if a and a.name and a.id:
+                    if str(a.id) == str(artist.id) and a.name.lower().strip() == artist.name.lower().strip():
+                        strict_tracks.append(t)
+                        break
 
     unique_tracks_list = deduplicate_tracks(strict_tracks)
     unique_tracks = {t.id: t for t in unique_tracks_list}
@@ -338,10 +388,10 @@ def _handle_artist_search(client, amazon_client, query, quality, downloader, wri
     ))
 
     if discarded_albums:
-        console.print(f"\n[bold red]:heavy_check_mark: Catalog purified![/bold red] [dim]Hid {len(discarded_albums)} impostor releases.[/dim]\n")
+        console.print(f"\n[bold red]Catalog cleaned.[/bold red] [dim]Hidden {len(discarded_albums)} non-matching releases.[/dim]\n")
 
     track_table = _create_compact_table(
-        f":musical_note: Official Tracks for {artist.name}",["#", "Title", "Artist(s)", "Album", "Quality", "Duration"]
+        f"Official Tracks for {artist.name}",["#", "Title", "Artist(s)", "Album", "Quality", "Duration"]
     )
     
     for i, t in enumerate(sorted_tracks, 1):
@@ -408,13 +458,24 @@ def _parse_choice(choice, items, is_dict=False):
     parts = choice.split(",")
     for part in parts:
         part = part.strip()
+        if not part:
+            continue
         if "-" in part:
-            start, end = map(int, part.split("-"))
+            try:
+                start_str, end_str = part.split("-", 1)
+                start, end = int(start_str), int(end_str)
+            except ValueError:
+                continue
+            if start > end:
+                start, end = end, start
             for idx in range(start - 1, end):
                 if 0 <= idx < len(items):
                     selected.append(items[idx])
         else:
-            idx = int(part) - 1
+            try:
+                idx = int(part) - 1
+            except ValueError:
+                continue
             if 0 <= idx < len(items):
                 selected.append(items[idx])
     return selected

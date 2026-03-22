@@ -51,10 +51,10 @@ class PlaylistExtractor:
 
         # if work, we use the official API
         if token:
-            self.session.headers.update({"Authorization": f"Bearer {token}"})
+            auth_headers = {"Authorization": f"Bearer {token}"}
             info_url = f"https://api.spotify.com/v1/playlists/{pid}"
             
-            info_resp = self.session.get(info_url)
+            info_resp = self.session.get(info_url, headers=auth_headers)
             if info_resp.status_code == 200:
                 info_json = info_resp.json()
                 playlist_name = info_json.get("name", "Spotify Playlist")
@@ -63,7 +63,7 @@ class PlaylistExtractor:
                 tracks =[]
                 
                 while api_url:
-                    resp = self.session.get(api_url)
+                    resp = self.session.get(api_url, headers=auth_headers)
                     if resp.status_code != 200:
                         break
                     resp_json = resp.json()

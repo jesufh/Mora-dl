@@ -19,26 +19,28 @@ class Downloader:
         })
 
     def _download_file(self, url: str, dest: str, desc: str = None, silent: bool = False) -> None:
-        resp = self.session.get(url, stream=True)
-        resp.raise_for_status()
-        
-        if silent:
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return
+        with self.session.get(url, stream=True) as resp:
+            resp.raise_for_status()
+            
+            if silent:
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                return
 
-        total = int(resp.headers.get("content-length", 0))
-        with open(dest, "wb") as f, tqdm(
-            desc=desc or os.path.basename(dest),
-            total=total,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as pbar:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                pbar.update(len(chunk))
+            total = int(resp.headers.get("content-length", 0))
+            with open(dest, "wb") as f, tqdm(
+                desc=desc or os.path.basename(dest),
+                total=total,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as pbar:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
 
     def download_track(self, track_id: Union[int, str], manifest_data: dict, metadata: TrackInfo) -> str:
         inner = manifest_data.get("data", {})
@@ -77,13 +79,13 @@ class Downloader:
         final_path = os.path.join(self.output_dir, filename)
         
         if drm_key:
-            # Descargamos a un archivo temporal MP4 cifrado
+            # Download into an encrypted temporary MP4 file.
             temp_path = os.path.join(self.output_dir, f"{metadata.id}_encrypted.mp4")
             self._download_file(url, temp_path, desc=metadata.title)
             
             ffmpeg_cmd = self._get_ffmpeg_path()
             try:
-                # Usamos FFmpeg para descifrar el CENC y extraer el stream FLAC sin perder calidad (-c:a copy)
+                # Use FFmpeg to decrypt CENC and extract FLAC without re-encoding (-c:a copy).
                 subprocess.run([
                     ffmpeg_cmd, "-y", 
                     "-decryption_key", drm_key, 
@@ -100,11 +102,11 @@ class Downloader:
                     os.remove(temp_path)
                 raise Exception(f"Error decrypting and extracting FLAC with FFmpeg: {e}")
                 
-            # Limpiamos el archivo temporal
+            # Remove temporary file after decryption/conversion.
             if os.path.exists(temp_path):
                 os.remove(temp_path)
         else:
-            # Si no hay clave DRM, asumimos que ya es un FLAC crudo
+            # If there is no DRM key, assume the stream is raw FLAC.
             self._download_file(url, final_path, desc=metadata.title)
             
         return final_path
@@ -153,41 +155,37 @@ class Downloader:
             self._download_file(media_url, out_path, desc=metadata.title)
             return out_path
 
-        segments =[]
+        segment_count = 0
         for s in timeline.findall(".//mpd:S", ns) or timeline.findall("S"):
-            d = int(s.get("d"))
-            r = int(s.get("r", 0)) + 1
-            segments.extend([d] * r)
+            repeat = int(s.get("r", 0)) + 1
+            segment_count += repeat
+
+        if segment_count == 0:
+            raise ValueError("No segments found in SegmentTimeline")
 
         init_url = urljoin(base_url, init_template)
         init_path = os.path.join(self.output_dir, f"{metadata.id}_init.m4s")
         self._download_file(init_url, init_path, silent=True)
 
-        media_paths =[]
-        with tqdm(total=len(segments), desc=metadata.title, unit="seg") as pbar:
-            for i in range(1, len(segments) + 1):
-                seg_url = urljoin(base_url, media_template.replace("$Number$", str(i)))
-                seg_path = os.path.join(self.output_dir, f"{metadata.id}_seg_{i}.m4s")
-                self._download_file(seg_url, seg_path, silent=True)
-                media_paths.append(seg_path)
-                pbar.update(1)
-
         temp_mp4 = os.path.join(self.output_dir, f"{metadata.id}_temp.mp4")
-
-        with open(temp_mp4, "wb") as out:
-            with open(init_path, "rb") as f:
-                out.write(f.read())
-            for mp in media_paths:
-                with open(mp, "rb") as f:
-                    out.write(f.read())
-
-        os.remove(init_path)
-        for mp in media_paths:
-            os.remove(mp)
 
         ffmpeg_cmd = self._get_ffmpeg_path()
 
         try:
+            with open(temp_mp4, "wb") as out:
+                with open(init_path, "rb") as f:
+                    out.write(f.read())
+
+                with tqdm(total=segment_count, desc=metadata.title, unit="seg") as pbar:
+                    for i in range(1, segment_count + 1):
+                        seg_url = urljoin(base_url, media_template.replace("$Number$", str(i)))
+                        with self.session.get(seg_url, stream=True) as seg_resp:
+                            seg_resp.raise_for_status()
+                            for chunk in seg_resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    out.write(chunk)
+                        pbar.update(1)
+
             subprocess.run([
                 ffmpeg_cmd, "-y", "-i", temp_mp4, "-c:a", "copy", out_path
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -196,6 +194,8 @@ class Downloader:
         except subprocess.CalledProcessError as e:
             raise Exception(f"Error processing DASH file with FFmpeg: {e}")
         finally:
+            if os.path.exists(init_path):
+                os.remove(init_path)
             if os.path.exists(temp_mp4):
                 os.remove(temp_mp4)
 

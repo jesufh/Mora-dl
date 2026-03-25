@@ -1,19 +1,28 @@
 import os
 import re
-import urllib.parse
-import unicodedata
+from typing import List
+
 import click
-import requests
-from rich.console import Console
-from rich.table import Table
-from rich.prompt import Prompt
 from rich import box
-from .api import APIClient, AmazonAPIClient
-from .downloader import Downloader
+from rich.console import Console
+from rich.prompt import Prompt
+from rich.table import Table
+
+from .api import (
+    APIClient,
+    AmazonAPIClient,
+    CatalogService,
+    MusicBrainzMetadataProvider,
+    _get_field,
+    deduplicate_tracks,
+    normalize_text,
+)
+from .downloader import DownloadInterrupted, Downloader
 from .metadata import MetadataWriter
 from .playlist import PlaylistExtractor
 
 console = Console()
+
 
 @click.command(help="Download tracks, albums, artists, or playlists based on a search query.")
 @click.option("--track", is_flag=True, help="Search for specific tracks")
@@ -29,471 +38,384 @@ def cli(track, album, artist, playlist, query, quality, output):
         console.print("[red]You must specify exactly one of: --track, --album, --artist, --playlist[/red]")
         return
 
-    client = APIClient()
-    amazon_client = AmazonAPIClient()
+    service = CatalogService([APIClient(), AmazonAPIClient()], metadata_provider=MusicBrainzMetadataProvider())
     downloader = Downloader(output)
     writer = MetadataWriter()
 
-    if track: _handle_track_search(client, amazon_client, query, quality, downloader, writer)
-    elif album: _handle_album_search(client, amazon_client, query, quality, downloader, writer)
-    elif artist: _handle_artist_search(client, amazon_client, query, quality, downloader, writer)
-    elif playlist: _handle_playlist_download(client, amazon_client, query, quality, output, writer)
+    if track:
+        _handle_track_search(service, query, quality, downloader, writer)
+    elif album:
+        _handle_album_search(service, query, quality, downloader, writer)
+    elif artist:
+        _handle_artist_search(service, query, quality, downloader, writer)
+    elif playlist:
+        _handle_playlist_download(service, query, quality, output, writer)
+
+
+# ── Formatting helpers ──────────────────────────────────────────────
 
 def format_artists(artists_data) -> str:
+    primary_artist = None
+    if hasattr(artists_data, "artists") or isinstance(artists_data, dict):
+        primary_artist = _get_field(artists_data, "artist")
+        artists_data = _get_field(artists_data, "artists", [])
     seen = set()
     artists_list = []
-    for a in (artists_data or[]):
-        name = a.name if hasattr(a, 'name') else a.get('name', '')
+    for artist in artists_data or []:
+        name = artist.name if hasattr(artist, "name") else artist.get("name", "")
+        if not name:
+            continue
+        canonical = name.upper()
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        artists_list.append(name)
+    if not artists_list and primary_artist is not None:
+        name = primary_artist.name if hasattr(primary_artist, "name") else primary_artist.get("name", "")
         if name:
-            name_upper = name.upper()
-            if name_upper not in seen:
-                seen.add(name_upper)
-                artists_list.append(name)
+            artists_list.append(name)
+    if not artists_list:
+        return "Unknown"
     return ", ".join(artists_list[:3]) + ("..." if len(artists_list) > 3 else "")
 
+
 def format_title(item) -> str:
-    title = item.title if hasattr(item, 'title') else item.get('title', '')
-    version = item.version if hasattr(item, 'version') else item.get('version', '')
+    title = _get_field(item, "title", "Unknown Title")
+    version = _get_field(item, "version", "")
+    explicit = _get_field(item, "explicit", False)
     if version and version.lower() not in title.lower():
         title = f"{title} ({version})"
+    if explicit:
+        title = f"{title} 🅴"
     return title
 
-def deduplicate_tracks(tracks_list):
-    unique_tracks = {}
-    qualities = {"LOW": 1, "HIGH": 2, "LOSSLESS": 3, "HI_RES_LOSSLESS": 4}
 
-    for t in tracks_list:
-        title_key = normalize_str(t.title)
-        album_key = normalize_str(t.album.title if t.album else "")
-        key = (title_key, album_key, getattr(t, 'explicit', False))
-        
-        if key not in unique_tracks:
-            unique_tracks[key] = t
-        else:
-            curr_q = qualities.get(unique_tracks[key].audioQuality, 0)
-            new_q = qualities.get(t.audioQuality, 0)
-            if new_q > curr_q:
-                unique_tracks[key] = t
-                
-    return list(unique_tracks.values())
+def _quality_from_audio_fields(item) -> str:
+    bit_depth = _get_field(item, "bitDepth")
+    sample_rate = _get_field(item, "sampleRate")
+    if bit_depth is not None and sample_rate is not None:
+        try:
+            if int(bit_depth) > 16 or int(sample_rate) > 44100:
+                return "HI_RES_LOSSLESS"
+            return "LOSSLESS"
+        except (TypeError, ValueError):
+            pass
 
-def sanitize_foldername(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    resolved = _get_field(item, "resolvedQuality")
+    if resolved:
+        return resolved
 
-def _handle_track_search(client, amazon_client, query, quality, downloader, writer):
+    quality = _get_field(item, "audioQuality")
+    if quality:
+        return quality
+
+    codec = _get_field(item, "streamCodec") or _get_field(item, "codec")
+    if codec == "flac":
+        return "LOSSLESS"
+    if codec == "aac":
+        return "HIGH"
+    return "N/A"
+
+
+def _quality_label(item) -> str:
+    quality = _quality_from_audio_fields(item)
+    bit_depth = _get_field(item, "bitDepth")
+    sample_rate = _get_field(item, "sampleRate")
+    if quality in {"LOSSLESS", "HI_RES_LOSSLESS"} and bit_depth and sample_rate:
+        return f"{quality} ({bit_depth}-bit/{sample_rate}Hz)"
+    return quality
+
+
+def _provider_label(provider: str | None) -> str:
+    return {
+        "primary": "TIDAL",
+        "amazon": "AMZN",
+        "musicbrainz_metadata": "MB",
+    }.get(provider or "", provider or "UNKNOWN")
+
+
+def _is_metadata_provider(provider: str | None) -> bool:
+    return provider == "musicbrainz_metadata"
+
+
+def _format_release_date(value: str | None) -> str:
+    if not value:
+        return "-"
+    return value[:10]
+
+
+def _format_disc_track(item) -> tuple[str, str]:
+    disc = _get_field(item, "volumeNumber")
+    track = _get_field(item, "trackNumber")
+    return (str(disc or "-"), str(track or "-"))
+
+
+def _display_text(value: str | None, fallback: str = "-") -> str:
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    return text or fallback
+
+
+def _album_label(item) -> str:
+    album = _get_field(item, "album")
+    if not album:
+        return "-"
+    return _display_text(_get_field(album, "title"))
+
+
+def _format_duration(value: int | None) -> str:
+    if not value or value < 0:
+        return "-:--"
+    mins, secs = divmod(int(value), 60)
+    return f"{mins}:{secs:02d}"
+
+
+# ── Search handlers ──────────────────────────────────────────────
+
+def _handle_track_search(service, query, quality, downloader, writer):
     with console.status("[bold green]Searching for tracks..."):
-        all_tracks = client.search_tracks(query)
-        if not all_tracks:
-            console.print("[yellow]Not found in primary API, trying Amazon API...[/yellow]")
-            all_tracks = amazon_client.search_tracks(query)
-
-    q_lower = query.lower().strip()
-    matched_tracks = [t for t in all_tracks if q_lower in t.title.lower()]
-    tracks = deduplicate_tracks(matched_tracks)
+        tracks = service.search_tracks(query)
 
     if not tracks:
-        console.print("[red]No tracks found matching your search exactly.[/red]")
+        console.print("[red]No tracks found.[/red]")
         return
 
-    table = _create_compact_table("Found Tracks",["#", "Title", "Artist(s)", "Album", "Quality", "Duration"])
-    for i, t in enumerate(tracks, 1):
-        artists_str = format_artists(t.artists)
-        mins, secs = divmod(t.duration, 60)
+    table = _create_compact_table("Found Tracks", ["#", "Title", "Artist(s)", "Album", "Provider", "Quality", "Duration"])
+    for index, track in enumerate(tracks, 1):
         table.add_row(
-            str(i), 
-            format_title(t), 
-            artists_str, 
-            t.album.title if t.album else "Unknown", 
-            t.audioQuality or "N/A", 
-            f"{mins}:{secs:02d}"
+            str(index),
+            format_title(track),
+            format_artists(track),
+            _album_label(track),
+            _provider_label(track.provider),
+            _quality_label(track),
+            _format_duration(track.duration),
         )
     console.print(table)
 
     choice = Prompt.ask("Numbers to download (e.g., 1,3-5, all)", default="all")
     selected = tracks if choice.lower() == "all" else _parse_choice(choice, tracks)
     for track in selected:
-        _download_track(track.id, quality, client, amazon_client, downloader, writer)
+        _download_track(track, quality, service, downloader, writer)
 
-def _handle_album_search(client, amazon_client, query, quality, downloader, writer):
-    using_amazon = False
+
+def _handle_album_search(service, query, quality, downloader, writer):
     with console.status("[bold green]Searching for albums..."):
-        all_tracks = client.search_tracks(query)
-        if not all_tracks:
-            using_amazon = True
-            all_tracks = amazon_client.search_tracks(query)
+        albums = service.search_albums(query)
 
-    q_lower = query.lower().strip()
-    albums_dict = {}
-    album_tracks = {}
-    
-    for t in all_tracks:
-        if t.album and q_lower in t.album.title.lower():
-            album_id = t.album.id
-            if using_amazon:
-                artist_label = t.artist.name if t.artist and t.artist.name else "Unknown"
-                album_id = f"amz:{normalize_str(t.album.title)}:{normalize_str(artist_label)}"
-                t.album.id = album_id
-            if album_id not in albums_dict:
-                t.album.artist = t.artists[0] if t.artists else None
-                albums_dict[album_id] = t.album
-                album_tracks[album_id] = []
-            album_tracks[album_id].append(t)
-
-    albums = list(albums_dict.values())
     if not albums:
-        console.print("[red]No albums found matching your search exactly.[/red]")
+        console.print("[red]No albums found.[/red]")
         return
 
-    table = _create_compact_table("Found Albums", ["#", "Album", "Artist", "ID"])
-    for i, al in enumerate(albums, 1):
-        artist_name = al.artist.name if al.artist else "Various"
-        table.add_row(str(i), al.title, artist_name, str(al.id))
+    metadata_albums = albums and _is_metadata_provider(albums[0].provider)
+    columns = ["#", "Album", "Artist", "Date", "Edition", "MBID"] if metadata_albums else ["#", "Album", "Artist", "Provider", "Seed Tracks"]
+    table = _create_compact_table("Found Albums", columns)
+    for index, album in enumerate(albums, 1):
+        if metadata_albums:
+            table.add_row(
+                str(index),
+                _display_text(album.title),
+                _display_text(album.artist.name if album.artist else None, "Various"),
+                _format_release_date(album.releaseDate),
+                album.disambiguation or "-",
+                str(album.id),
+            )
+        else:
+            table.add_row(
+                str(index),
+                _display_text(album.title),
+                _display_text(album.artist.name if album.artist else None, "Various"),
+                _provider_label(album.provider),
+                str(len(album.tracks)),
+            )
     console.print(table)
 
-    choice = Prompt.ask("Album number to view tracks (e.g., 1)", default="1")
+    choice = Prompt.ask("Album number to view tracks", default="1")
     try:
-        idx = int(choice) - 1
-        if idx < 0 or idx >= len(albums):
-            console.print("[red]Invalid number[/red]")
-            return
-        album = albums[idx]
-    except ValueError:
+        album = albums[int(choice) - 1]
+    except (ValueError, IndexError):
         console.print("[red]Invalid number[/red]")
-        return
-
-    table = _create_compact_table(f"Tracks in {album.title}",["#", "Title", "Artist(s)", "Quality", "Duration", "ID"])
-    if using_amazon:
-        selected_album_tracks = deduplicate_tracks(album_tracks.get(album.id, []))
-        if not selected_album_tracks:
-            console.print("[red]No tracks found in this album.[/red]")
-            return
-
-        for i, track in enumerate(selected_album_tracks, 1):
-            artists_str = format_artists(track.artists)
-            mins, secs = divmod(track.duration, 60)
-            table.add_row(
-                str(i),
-                format_title(track),
-                artists_str,
-                track.audioQuality or "N/A",
-                f"{mins}:{secs:02d}",
-                str(track.id),
-            )
-        console.print(table)
-
-        choice = Prompt.ask("Numbers to download (e.g., 1,3-5, all)", default="all")
-        selected_tracks = selected_album_tracks if choice.lower() == "all" else _parse_choice(choice, selected_album_tracks)
-        for track in selected_tracks:
-            _download_track(track.id, quality, client, amazon_client, downloader, writer)
         return
 
     with console.status(f"[bold green]Fetching tracks for {album.title}..."):
-        album_info = client.get_album(album.id)
+        tracks = service.get_album_tracks(album)
 
-    if not album_info.items:
+    if not tracks:
         console.print("[red]No tracks found in this album.[/red]")
         return
 
-    for i, item in enumerate(album_info.items, 1):
-        artists_str = format_artists(item.get("artists",[]))
-        mins, secs = divmod(item.get("duration", 0), 60)
-        table.add_row(
-            str(i), 
-            format_title(item), 
-            artists_str, 
-            item.get("audioQuality", "N/A"), 
-            f"{mins}:{secs:02d}", 
-            str(item.get("id", ""))
-        )
-    console.print(table)
+    _display_track_table(tracks, f"Tracks in {album.title}")
 
     choice = Prompt.ask("Numbers to download (e.g., 1,3-5, all)", default="all")
-    selected = album_info.items if choice.lower() == "all" else _parse_choice(choice, album_info.items, is_dict=True)
-    for item in selected:
-        track_id = item.get("id")
-        if track_id:
-            _download_track(track_id, quality, client, amazon_client, downloader, writer)
+    selected = tracks if choice.lower() == "all" else _parse_choice(choice, tracks)
+    for track in selected:
+        _download_track(track, quality, service, downloader, writer)
 
-def normalize_str(s):
-    if not s: return ""
-    s = s.lower().strip()
-    s = re.sub(r'\(.*?\)', '', s)  
-    s = re.sub(r'\[.*?\]', '', s)
-    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-    s = re.sub(r'[^a-z0-9]', '', s) 
-    return s
 
-def get_itunes_fingerprint(artist_name: str):
-    search_url = f"https://itunes.apple.com/search?term={urllib.parse.quote(artist_name)}&entity=song&limit=50"
-    albums = set()
-    tracks = set()
-    try:
-        resp = requests.get(search_url, timeout=5)
-        if resp.status_code != 200:
-            return albums, tracks
-            
-        results = resp.json().get("results",[])
-        artist_ids = {}
-        target_name = artist_name.lower()
-        
-        for item in results:
-            if item.get("artistName", "").lower() == target_name:
-                aid = item.get("artistId")
-                if aid:
-                    artist_ids[aid] = artist_ids.get(aid, 0) + 1
-
-        if not artist_ids:
-            return albums, tracks
-
-        main_artist_id = max(artist_ids, key=artist_ids.get)
-        lookup_url = f"https://itunes.apple.com/lookup?id={main_artist_id}&entity=song&limit=200"
-        resp2 = requests.get(lookup_url, timeout=5)
-        
-        if resp2.status_code == 200:
-            for item in resp2.json().get("results",[]):
-                if item.get("collectionName"):
-                    albums.add(normalize_str(item["collectionName"]))
-                if item.get("trackName"):
-                    tracks.add(normalize_str(item["trackName"]))
-
-        for item in results:
-            if target_name in item.get("artistName", "").lower():
-                if item.get("artistName", "").lower() == target_name:
-                    if item.get("artistId") != main_artist_id:
-                        continue 
-                if item.get("collectionName"): 
-                    albums.add(normalize_str(item["collectionName"]))
-                if item.get("trackName"): 
-                    tracks.add(normalize_str(item["trackName"]))
-    except Exception:
-        pass
-    return albums, tracks
-
-def _handle_artist_search(client, amazon_client, query, quality, downloader, writer):
-    using_amazon = False
+def _handle_artist_search(service, query, quality, downloader, writer):
     with console.status("[bold green]Searching for artists..."):
-        tracks = client.search_tracks(query)
-        if not tracks:
-            using_amazon = True
-            tracks = amazon_client.search_tracks(query)
+        artists = service.search_artists(query)
 
-    artists_dict = {}
-    q_lower = query.lower().strip()
-    for t in tracks:
-        for a in (t.artists or[]):
-            if a.name and a.name.lower().strip() == q_lower:
-                if a.id not in artists_dict:
-                    artists_dict[a.id] = a
+    exact_name = normalize_text(query)
+    artists = [artist for artist in artists if normalize_text(artist.name) == exact_name] or artists
 
-    artists = list(artists_dict.values())
     if not artists:
-        console.print(f"[red]No artists found with the exact name '{query}'.[/red]")
+        console.print(f"[red]No artists found with the name '{query}'.[/red]")
         return
 
-    artist_table = _create_compact_table("Found Artists", ["#", "Artist", "ID"])
-    for i, a in enumerate(artists, 1):
-        artist_table.add_row(str(i), a.name, str(a.id))
-    console.print(artist_table)
+    metadata_artists = artists and _is_metadata_provider(artists[0].provider)
+    columns = ["#", "Artist", "Area", "Type", "About", "MBID"] if metadata_artists else ["#", "Artist", "Provider", "Seed Tracks", "ID"]
+    table = _create_compact_table("Found Artists", columns)
+    for index, artist in enumerate(artists, 1):
+        if metadata_artists:
+            table.add_row(
+                str(index),
+                _display_text(artist.name),
+                artist.area or "-",
+                artist.type or "-",
+                artist.disambiguation or "-",
+                str(artist.id),
+            )
+        else:
+            table.add_row(str(index), _display_text(artist.name), _provider_label(artist.provider), str(len(artist.tracks)), str(artist.id))
+    console.print(table)
 
-    choice = Prompt.ask("Artist number (e.g., 1)", default="1")
+    choice = Prompt.ask("Artist number", default="1")
     try:
-        idx = int(choice) - 1
-        if idx < 0 or idx >= len(artists):
-            console.print("[red]Invalid number[/red]")
-            return
-        artist = artists[idx]
-    except ValueError:
+        artist = artists[int(choice) - 1]
+    except (ValueError, IndexError):
         console.print("[red]Invalid number[/red]")
         return
 
-    if using_amazon:
-        strict_tracks = []
-        for t in tracks:
-            track_artists = list(t.artists or [])
-            if t.artist:
-                track_artists.append(t.artist)
-            for a in track_artists:
-                if a and a.name and a.id:
-                    if str(a.id) == str(artist.id) and a.name.lower().strip() == artist.name.lower().strip():
-                        strict_tracks.append(t)
-                        break
-    else:
-        with console.status("[bold green]Authenticating discography (removing false metadata)..."):
-            artist_info = client.get_artist(artist.id)
+    with console.status("[bold green]Fetching artist catalog..."):
+        strict_tracks = service.get_artist_tracks(artist)
 
-        if not artist_info.tracks:
-            console.print("[red]No tracks found for this artist.[/red]")
-            return
+    if not strict_tracks:
+        console.print("[red]No tracks found for this artist.[/red]")
+        return
 
-        strict_tracks =[]
-        for t in artist_info.tracks:
-            track_artists = list(t.artists or [])
-            if t.artist:
-                track_artists.append(t.artist)
-            for a in track_artists:
-                if a and a.name and a.id:
-                    if str(a.id) == str(artist.id) and a.name.lower().strip() == artist.name.lower().strip():
-                        strict_tracks.append(t)
-                        break
-
-    unique_tracks_list = deduplicate_tracks(strict_tracks)
-    unique_tracks = {t.id: t for t in unique_tracks_list}
-
-    itunes_albums, itunes_tracks = get_itunes_fingerprint(artist.name)
-    
-    verified_album_ids = set()
-    if itunes_albums or itunes_tracks:
-        for t in unique_tracks.values():
-            n_album = normalize_str(t.album.title if t.album else "")
-            n_track = normalize_str(t.title)
-            if n_album in itunes_albums or n_track in itunes_tracks:
-                if t.album:
-                    verified_album_ids.add(t.album.id)
-
-    final_tracks =[]
-    discarded_albums = set()
-    
-    for t in unique_tracks.values():
-        is_verified = False
-        if not itunes_albums and not itunes_tracks:
-            is_verified = True if (t.popularity or 0) >= 5 else False
-        else:
-            n_album = normalize_str(t.album.title if t.album else "")
-            n_track = normalize_str(t.title)
-
-            if t.album and t.album.id in verified_album_ids: is_verified = True
-            elif n_track in itunes_tracks: is_verified = True
-            elif n_album in itunes_albums: is_verified = True
-            elif t.popularity and t.popularity >= 50: is_verified = True
-
-        if is_verified:
-            final_tracks.append(t)
-        else:
-            if t.album: discarded_albums.add(t.album.title)
-
-    if not final_tracks:
-        final_tracks = list(unique_tracks.values())
-
-    album_pops = {}
-    for t in final_tracks:
-        al_key = normalize_str(t.album.title if t.album else "")
-        pop = t.popularity or 0
-        if al_key not in album_pops or pop > album_pops[al_key]:
-            album_pops[al_key] = pop
-
-    sorted_tracks = sorted(final_tracks, key=lambda x: (
-        -album_pops.get(normalize_str(x.album.title if x.album else ""), 0),
-        normalize_str(x.album.title if x.album else ""),
-        x.trackNumber or 0
-    ))
-
-    if discarded_albums:
-        console.print(f"\n[bold red]Catalog cleaned.[/bold red] [dim]Hidden {len(discarded_albums)} non-matching releases.[/dim]\n")
-
-    track_table = _create_compact_table(
-        f"Official Tracks for {artist.name}",["#", "Title", "Artist(s)", "Album", "Quality", "Duration"]
-    )
-    
-    for i, t in enumerate(sorted_tracks, 1):
-        artists_str = format_artists(t.artists)
-        mins, secs = divmod(t.duration, 60)
-        track_table.add_row(
-            str(i), 
-            format_title(t), 
-            artists_str, 
-            t.album.title if t.album else "Unknown", 
-            t.audioQuality or "N/A", 
-            f"{mins}:{secs:02d}"
-        )
-    console.print(track_table)
+    strict_tracks = _sort_artist_tracks(strict_tracks)
+    _display_track_table(strict_tracks, "Artist Tracks")
 
     choice = Prompt.ask("Numbers to download (e.g., 1,3-5, all)", default="all")
-    selected = sorted_tracks if choice.lower() == "all" else _parse_choice(choice, sorted_tracks)
+    selected = strict_tracks if choice.lower() == "all" else _parse_choice(choice, strict_tracks)
     for track in selected:
-        _download_track(track.id, quality, client, amazon_client, downloader, writer)
+        _download_track(track, quality, service, downloader, writer)
 
-def _handle_playlist_download(client, amazon_client, url, quality, base_output, writer):
+
+def _display_track_table(tracks: list, title: str) -> None:
+    """Unified track table display that adapts columns to data source."""
+    if not tracks:
+        return
+
+    is_metadata = _is_metadata_provider(tracks[0].provider)
+    if is_metadata:
+        columns = ["#", "Title", "Artist(s)", "Album", "Disc", "Track", "Duration"]
+    else:
+        columns = ["#", "Title", "Artist(s)", "Album", "Provider", "Quality", "Duration"]
+
+    table = _create_compact_table(title, columns)
+    for index, track in enumerate(tracks, 1):
+        if is_metadata:
+            disc, track_no = _format_disc_track(track)
+            table.add_row(
+                str(index),
+                format_title(track),
+                format_artists(track),
+                _album_label(track),
+                disc,
+                track_no,
+                _format_duration(track.duration),
+            )
+        else:
+            table.add_row(
+                str(index),
+                format_title(track),
+                format_artists(track),
+                _album_label(track),
+                _provider_label(track.provider),
+                _quality_label(track),
+                _format_duration(track.duration),
+            )
+    console.print(table)
+
+
+def _sort_artist_tracks(tracks: List) -> List:
+    final_tracks = deduplicate_tracks(tracks)
+    return sorted(
+        final_tracks,
+        key=lambda track: (
+            _format_release_date(track.releaseDate),
+            normalize_text(track.album.title if track.album else ""),
+            track.volumeNumber or 0,
+            track.trackNumber or 0,
+        ),
+    )
+
+
+def _handle_playlist_download(service, url, quality, base_output, writer):
     with console.status("[bold green]Extracting playlist metadata..."):
         extractor = PlaylistExtractor()
         try:
             playlist_name, tracks = extractor.get_tracks(url)
-        except Exception as e:
-            console.print(f"[red]Error extracting playlist: {e}[/red]")
+        except Exception as exc:
+            console.print(f"[red]Error extracting playlist: {exc}[/red]")
             return
 
-    if not tracks:
-        console.print("[red]No tracks found in the provided playlist URL.[/red]")
-        return
+    output_dir = os.path.join(base_output, sanitize_foldername(playlist_name))
+    downloader = Downloader(output_dir)
+    console.print(f"[bold green]Playlist:[/bold green] {playlist_name}")
 
-    safe_name = sanitize_foldername(playlist_name) or "Playlist"
-    playlist_dir = os.path.join(base_output, safe_name)
-    downloader = Downloader(playlist_dir)
-
-    console.print(f"[green]Found {len(tracks)} tracks in '{playlist_name}'. Starting matching and download...[/green]")
-    
-    for t in tracks:
-        query = f"{t['title']} {t['artist']}".strip()
+    for item in tracks:
+        query = f"{item['title']} {item['artist']}".strip()
         console.print(f"\n[cyan]Searching:[/cyan] {query}")
-        
-        results = client.search_tracks(query)
+        results = service.search_tracks(query, title_only_fallback=item["title"])
         if not results:
-            results = client.search_tracks(t['title'])
-            
-        if not results:
-            console.print("[yellow]Not found in primary API, trying Amazon API...[/yellow]")
-            results = amazon_client.search_tracks(query)
-            if not results:
-                results = amazon_client.search_tracks(t['title'])
-            
-        if not results:
-            console.print(f"[red]Not found in any API: {t['title']}[/red]")
+            console.print(f"[red]Not found in any API: {item['title']}[/red]")
             continue
-            
-        best = deduplicate_tracks(results)
-        target_track = best[0] if best else results[0]
-        _download_track(target_track.id, quality, client, amazon_client, downloader, writer)
+        target_track = results[0]
+        _download_track(target_track, quality, service, downloader, writer)
 
-def _parse_choice(choice, items, is_dict=False):
-    selected =[]
-    parts = choice.split(",")
-    for part in parts:
+
+def sanitize_foldername(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+
+
+def _parse_choice(choice, items):
+    selected = []
+    for part in choice.split(","):
         part = part.strip()
         if not part:
             continue
         if "-" in part:
+            start_str, end_str = part.split("-", 1)
             try:
-                start_str, end_str = part.split("-", 1)
-                start, end = int(start_str), int(end_str)
+                start = int(start_str) - 1
+                end = int(end_str) - 1
             except ValueError:
                 continue
-            if start > end:
-                start, end = end, start
-            for idx in range(start - 1, end):
-                if 0 <= idx < len(items):
-                    selected.append(items[idx])
-        else:
-            try:
-                idx = int(part) - 1
-            except ValueError:
-                continue
-            if 0 <= idx < len(items):
-                selected.append(items[idx])
+            for index in range(start, end + 1):
+                if 0 <= index < len(items):
+                    selected.append(items[index])
+            continue
+        try:
+            index = int(part) - 1
+        except ValueError:
+            continue
+        if 0 <= index < len(items):
+            selected.append(items[index])
     return selected
 
-def _download_track(track_id, quality, client, amazon_client, downloader, writer):
-    active_client = amazon_client if isinstance(track_id, str) else client
-    console.print(f"\n[yellow]Fetching information for track {track_id}...[/yellow]")
-    try:
-        info = active_client.get_track_info(track_id)
-        try:
-            manifest = active_client.get_track_manifest(track_id, quality)
-        except Exception:
-            alt_quality = "HI_RES_LOSSLESS" if quality == "LOSSLESS" else "LOSSLESS"
-            console.print(f"[yellow]Retrying with quality {alt_quality}...[/yellow]")
-            manifest = active_client.get_track_manifest(track_id, alt_quality)
 
+def _download_track(track_ref, quality, service, downloader, writer):
+    console.print(f"\n[yellow]Fetching information for track {track_ref.id}...[/yellow]")
+    try:
+        info, manifest, provider_name = service.resolve_download(track_ref, quality)
+        console.print(f"[green]Resolved provider: {_provider_label(provider_name)}[/green]")
+        console.print(f"[green]Resolved quality: {_quality_label(info)}[/green]")
         console.print(f"[green]Downloading audio: {info.title}[/green]")
-        filepath = downloader.download_track(track_id, manifest, info)
+        filepath = downloader.download_track(info.id, manifest, info)
 
         cover_data = None
         if info.album and info.album.cover:
@@ -507,9 +429,11 @@ def _download_track(track_id, quality, client, amazon_client, downloader, writer
         console.print("[yellow]Writing metadata to FLAC file...[/yellow]")
         writer.write_flac(filepath, info, cover_data)
         console.print("[bold green]Track successfully processed and saved![/bold green]")
+    except DownloadInterrupted as exc:
+        console.print(f"[yellow]Download interrupted. Partial file kept at: {exc.path}[/yellow]")
+    except Exception as exc:
+        console.print(f"[bold red]Error processing track {track_ref.id}: {exc}[/bold red]")
 
-    except Exception as e:
-        console.print(f"[bold red]Error processing track {track_id}: {e}[/bold red]")
 
 def _create_compact_table(title: str, columns: list) -> Table:
     table = Table(
@@ -522,26 +446,22 @@ def _create_compact_table(title: str, columns: list) -> Table:
         pad_edge=False,
         collapse_padding=True,
     )
-    
+
     for col in columns:
         if col == "#":
             table.add_column(col, style="#aec7cf", width=4, no_wrap=True)
         elif col == "ID":
             table.add_column(col, style="#aec7cf", width=10, no_wrap=True)
+        elif col == "MBID":
+            table.add_column(col, style="#aec7cf", width=10, no_wrap=True)
         elif col == "Duration":
-            table.add_column(col, style="#ffcc8e", justify="right", width=8, no_wrap=True) 
+            table.add_column(col, style="#ffcc8e", justify="right", width=8, no_wrap=True)
         elif col == "Quality":
-            table.add_column(col, style="#ffcc8e", justify="center", width=15, no_wrap=True)
-        elif col == "Title":
-            table.add_column(col, max_width=35, no_wrap=True, overflow="ellipsis")
-        elif col == "Artist(s)" or col == "Artist":
-            table.add_column(col, max_width=25, no_wrap=True, overflow="ellipsis")
-        elif col == "Album":
-            table.add_column(col, max_width=25, no_wrap=True, overflow="ellipsis")
+            table.add_column(col, style="#b5e48c", width=22, no_wrap=True)
+        elif col == "Provider":
+            table.add_column(col, style="#cdb4db", width=10, no_wrap=True)
+        elif col in {"Disc", "Track"}:
+            table.add_column(col, style="#aec7cf", width=5, no_wrap=True)
         else:
-            table.add_column(col, no_wrap=True, overflow="ellipsis") 
-
+            table.add_column(col, overflow="fold")
     return table
-
-if __name__ == "__main__":
-    cli()

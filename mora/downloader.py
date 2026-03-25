@@ -1,13 +1,22 @@
 import os
+import re
 import base64
 import json
+import logging
 import xml.etree.ElementTree as ET
 import subprocess
 from urllib.parse import urljoin
 from typing import Union
 import requests
+
+logger = logging.getLogger(__name__)
 from tqdm import tqdm
 from .models import TrackInfo
+
+class DownloadInterrupted(Exception):
+    def __init__(self, path: str, message: str = "Download interrupted"):
+        super().__init__(message)
+        self.path = path
 
 class Downloader:
     def __init__(self, output_dir: str = "downloads"):
@@ -19,28 +28,58 @@ class Downloader:
         })
 
     def _download_file(self, url: str, dest: str, desc: str = None, silent: bool = False) -> None:
-        with self.session.get(url, stream=True) as resp:
-            resp.raise_for_status()
-            
-            if silent:
-                with open(dest, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                return
+        existing_size = os.path.getsize(dest) if os.path.exists(dest) else 0
+        headers = {}
+        if existing_size > 0:
+            headers["Range"] = f"bytes={existing_size}-"
 
-            total = int(resp.headers.get("content-length", 0))
-            with open(dest, "wb") as f, tqdm(
-                desc=desc or os.path.basename(dest),
-                total=total,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as pbar:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        pbar.update(len(chunk))
+        try:
+            response = self.session.get(url, stream=True, headers=headers)
+        except requests.RequestException as exc:
+            raise DownloadInterrupted(dest, f"Download interrupted for {dest}") from exc
+
+        with response as resp:
+            resume = existing_size > 0 and resp.status_code == 206
+            if existing_size > 0 and resp.status_code == 200:
+                existing_size = 0
+                resume = False
+            resp.raise_for_status()
+
+            total = 0
+            content_range = resp.headers.get("content-range")
+            if content_range and "/" in content_range:
+                total_part = content_range.rsplit("/", 1)[-1]
+                if total_part.isdigit():
+                    total = int(total_part)
+            elif resp.headers.get("content-length"):
+                try:
+                    total = int(resp.headers.get("content-length", 0)) + existing_size
+                except ValueError:
+                    total = 0
+
+            mode = "ab" if resume else "wb"
+            try:
+                with open(dest, mode) as f:
+                    if silent:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                        return
+
+                    with tqdm(
+                        desc=desc or os.path.basename(dest),
+                        total=total if total > 0 else None,
+                        initial=existing_size if total > 0 else 0,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                    ) as pbar:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+            except (requests.RequestException, OSError) as exc:
+                raise DownloadInterrupted(dest, f"Download interrupted for {dest}") from exc
 
     def download_track(self, track_id: Union[int, str], manifest_data: dict, metadata: TrackInfo) -> str:
         inner = manifest_data.get("data", {})
@@ -168,27 +207,60 @@ class Downloader:
         self._download_file(init_url, init_path, silent=True)
 
         temp_mp4 = os.path.join(self.output_dir, f"{metadata.id}_temp.mp4")
-
+        state_path = f"{temp_mp4}.state"
         ffmpeg_cmd = self._get_ffmpeg_path()
+        completed = False
+        resume_from = 1
+
+        if os.path.exists(temp_mp4) and os.path.exists(state_path):
+            try:
+                with open(state_path, "r", encoding="utf-8") as state_file:
+                    last_segment = int(state_file.read().strip() or "0")
+                resume_from = max(1, last_segment + 1)
+            except (OSError, ValueError):
+                resume_from = 1
+        elif os.path.exists(temp_mp4):
+            try:
+                os.remove(temp_mp4)
+            except OSError:
+                pass
 
         try:
-            with open(temp_mp4, "wb") as out:
+            with open(temp_mp4, "ab" if resume_from > 1 else "wb") as out:
                 with open(init_path, "rb") as f:
-                    out.write(f.read())
+                    if resume_from == 1:
+                        out.write(f.read())
 
                 with tqdm(total=segment_count, desc=metadata.title, unit="seg") as pbar:
-                    for i in range(1, segment_count + 1):
+                    if resume_from > 1:
+                        pbar.update(resume_from - 1)
+
+                    for i in range(resume_from, segment_count + 1):
                         seg_url = urljoin(base_url, media_template.replace("$Number$", str(i)))
-                        with self.session.get(seg_url, stream=True) as seg_resp:
-                            seg_resp.raise_for_status()
-                            for chunk in seg_resp.iter_content(chunk_size=8192):
-                                if chunk:
-                                    out.write(chunk)
+                        try:
+                            with self.session.get(seg_url, stream=True) as seg_resp:
+                                seg_resp.raise_for_status()
+                                for chunk in seg_resp.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        out.write(chunk)
+                        except requests.RequestException as exc:
+                            try:
+                                with open(state_path, "w", encoding="utf-8") as state_file:
+                                    state_file.write(str(i - 1))
+                            except OSError:
+                                pass
+                            raise DownloadInterrupted(temp_mp4, f"Download interrupted for {metadata.title}") from exc
+                        try:
+                            with open(state_path, "w", encoding="utf-8") as state_file:
+                                state_file.write(str(i))
+                        except OSError:
+                            pass
                         pbar.update(1)
 
             subprocess.run([
                 ffmpeg_cmd, "-y", "-i", temp_mp4, "-c:a", "copy", out_path
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            completed = True
         except FileNotFoundError:
             raise Exception("FFmpeg is not available. Install 'imageio-ffmpeg' (pip install imageio-ffmpeg) or install FFmpeg on your system.")
         except subprocess.CalledProcessError as e:
@@ -196,11 +268,12 @@ class Downloader:
         finally:
             if os.path.exists(init_path):
                 os.remove(init_path)
-            if os.path.exists(temp_mp4):
+            if completed and os.path.exists(temp_mp4):
                 os.remove(temp_mp4)
+            if completed and os.path.exists(state_path):
+                os.remove(state_path)
 
         return out_path
 
     def _sanitize_filename(self, name: str) -> str:
-        import re
         return re.sub(r'[\\/*?:"<>|]', "", name).strip()

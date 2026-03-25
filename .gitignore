@@ -3,3 +3,5 @@ downloads/
 *.egg-info/
 __pycache__/
 .env
+.sx/*
+!.sx/*.md

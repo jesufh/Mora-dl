@@ -83,9 +83,27 @@ class MetadataWriter:
             audio["DATE"] = year
             audio["YEAR"] = year
 
-        if metadata.copyright: audio["COPYRIGHT"] = str(metadata.copyright)
-        if metadata.isrc: audio["ISRC"] = str(metadata.isrc)
-        if metadata.bpm is not None: audio["BPM"] = str(metadata.bpm)
+        if metadata.volumeNumber is not None:
+            audio["DISCNUMBER"] = str(metadata.volumeNumber)
+
+        if metadata.trackTotal is not None:
+            audio["TRACKTOTAL"] = str(metadata.trackTotal)
+
+        if metadata.discTotal is not None:
+            audio["DISCTOTAL"] = str(metadata.discTotal)
+
+        if metadata.copyright:
+            audio["COPYRIGHT"] = str(metadata.copyright)
+        if metadata.isrc:
+            audio["ISRC"] = str(metadata.isrc)
+        if metadata.genre:
+            audio["GENRE"] = str(metadata.genre)
+        if metadata.label:
+            audio["ORGANIZATION"] = str(metadata.label)
+        if metadata.composer:
+            audio["COMPOSER"] = str(metadata.composer)
+        if metadata.bpm is not None:
+            audio["BPM"] = str(metadata.bpm)
 
         if cover_data:
             pic = Picture()

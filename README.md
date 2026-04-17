@@ -26,8 +26,8 @@ pip install -r requirements.txt
 ## Documentation
 Use a series of easy-to-use arguments. For reference, you can use `--help`:
 ```bash
-.\mora <--track, --album, --artist>
-       <--query "entry">
+.\mora <--track, --album, --artist, --playlist>
+       <--query "entry"> #playlist: spotify url
        [--quality]
        [--outpot "directory"]
        [--backup]
